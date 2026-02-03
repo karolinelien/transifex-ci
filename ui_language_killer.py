@@ -8,9 +8,6 @@ tx_token = os.getenv("TX_TOKEN")
 
 tx = tx3.tx(org,tx_token)
 
-langs_not_to_propagate = ['l:uz', 'l:en_US']
-
-all_langs = set()
 project_langs = {}
 
 # get a list of the projects
@@ -25,9 +22,6 @@ for p in projects:
         for l in langs:
             #print(l.code)
             project_langs[p.name].add(l.id)
-            # we don't want to add languages that are not to be propagated
-            if l.id not in langs_not_to_propagate:
-                all_langs.add(l.id)
 
 print(all_langs)
 
@@ -35,10 +29,8 @@ for p in projects:
     if p.name[0:4] in ("ANDR", "APP-", "APP:"):
         print(p.name)
         # get project languages
-        for l in all_langs:
-            # print(l)
-            if l not in project_langs[p.name]:
-                print("language",l,"missing")
-                p.add_language(l)
+        if 'l:en_US' in project_langs[p.name]:
+            print("language en_US exists")
+            p.delete_language("l:en_US")
             
 
