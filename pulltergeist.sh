@@ -27,6 +27,12 @@ fi
 
 DEBUG="${DEBUG:-0}"
 
+# Merge gating:
+# - REQUIRE_MERGEABLE=1 means "only merge when PR appears merge-ready per GitHub (branch protection satisfied)"
+# - FORCE_MERGE=1 bypasses the merge-ready gate (still requires CI success)
+REQUIRE_MERGEABLE="${REQUIRE_MERGEABLE:-1}"
+FORCE_MERGE="${FORCE_MERGE:-0}"
+
 # safer bash defaults
 set -euo pipefail
 
@@ -58,6 +64,68 @@ git_setup() {
   git config hub.protocol https
 }
 
+get_pr_merge_info() {
+  local pr_id="$1"
+
+  # We assume we're running inside the target repo working tree.
+  local repo_full owner name
+  repo_full="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+  owner="${repo_full%%/*}"
+  name="${repo_full##*/}"
+
+  gh api graphql -f query='
+    query($owner:String!, $name:String!, $number:Int!) {
+      repository(owner:$owner, name:$name) {
+        pullRequest(number:$number) {
+          url
+          isDraft
+          mergeable
+          mergeStateStatus
+          reviewDecision
+        }
+      }
+    }' -f owner="$owner" -f name="$name" -F number="$pr_id" \
+    -q '.data.repository.pullRequest | {url,isDraft,mergeable,mergeStateStatus,reviewDecision}'
+}
+
+is_pr_ready_to_merge() {
+  # Returns 0 if PR looks merge-ready, else 1.
+  local pr_id="$1"
+  local info
+
+  if ! info="$(get_pr_merge_info "$pr_id" 2>/dev/null)"; then
+    log "Warning: failed to fetch merge info for PR ${pr_id}; treating as not ready."
+    return 1
+  fi
+
+  local is_draft mergeable merge_state review_decision
+  is_draft="$(echo "$info" | jq -r '.isDraft // false')"
+  mergeable="$(echo "$info" | jq -r '.mergeable // "UNKNOWN"')"
+  merge_state="$(echo "$info" | jq -r '.mergeStateStatus // "UNKNOWN"')"
+  review_decision="$(echo "$info" | jq -r '.reviewDecision // "UNKNOWN"')"
+
+  if [[ "$is_draft" == "true" ]]; then
+    log "PR ${pr_id} is draft; skipping merge."
+    return 1
+  fi
+
+  # Conservative: only proceed when GitHub says it's CLEAN.
+  # BLOCKED typically indicates missing protection requirements (reviews/checks/etc).
+  # BEHIND indicates head behind base. DIRTY indicates merge conflicts.
+  if [[ "$merge_state" != "CLEAN" ]]; then
+    log "PR ${pr_id} not merge-ready (mergeStateStatus=${merge_state}, reviewDecision=${review_decision}, mergeable=${mergeable}); skipping."
+    return 1
+  fi
+
+  # Extra guard
+  if [[ "$mergeable" == "CONFLICTING" ]]; then
+    log "PR ${pr_id} is conflicting; skipping merge."
+    return 1
+  fi
+
+  return 0
+}
+
 auto_varl () {
     local BASE="$1"
     declare -a array
@@ -87,13 +155,25 @@ EOF
             # explicitly check if the CI status of the PR is successful
             if [[ "${ci_status}" == "success" ]]
             then
+                if [[ "${FORCE_MERGE}" != "1" && "${REQUIRE_MERGEABLE}" == "1" ]]; then
+                    if ! is_pr_ready_to_merge "${pr_id}"; then
+                        rm "$body"
+                        sleep 1
+                        continue
+                    fi
+                fi
+
                 log "Attempting merge of PR ${pr_id}"
-                merge_output=$(hub api --method PUT "repos/{owner}/{repo}/pulls/${pr_id}/merge" --input "$body" 2>&1)
-                merge_status=$?
-                if [[ $merge_status -ne 0 ]]; then
-                    log "Merge failed for PR ${pr_id}. Status=$merge_status Output: ${merge_output}"
+
+                # IMPORTANT: don't let `set -e` abort the whole script on merge failure.
+                merge_output=""
+                if ! merge_output="$(gh api -X PUT "/repos/{owner}/{repo}/pulls/${pr_id}/merge" --input "$body" 2>&1)"; then
+                    log "Merge failed for PR ${pr_id}. Output: ${merge_output}"
+                    rm "$body"
+                    sleep 1
                     continue
                 fi
+
                 echo "Merge PR. Result: ${merge_output}"
             fi
 
@@ -224,3 +304,4 @@ done
 popd
 
 rm -rf temp$$
+
